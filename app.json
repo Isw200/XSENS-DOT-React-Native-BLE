@@ -2,6 +2,24 @@
   "expo": {
     "name": "app",
     "slug": "app",
-    "version": "1.0.0"
+    "version": "1.0.0",
+    "android": {
+      "package": "com.ozcodelabs.app",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "com.ozcodelabs.app",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "Bluetooth access is required to connect to the XSENS DOT sensor.",
+        "NSBluetoothPeripheralUsageDescription": "Bluetooth access is required to connect to the XSENS DOT sensor."
+      }
+    }
   }
 }
