@@ -14,37 +14,35 @@ import {
   FlatList,
 } from 'react-native';
 
-// ---------- DOT UUIDs ----------
+// ---------- DOT UUID helpers ----------
 const U = (short) => `1517${short}-4947-11e9-8646-d663bd873d93`;
 
 // Names seen on different firmwares
 const TARGET_NAME_PREFIXES = ['Movella DOT', 'Xsens DOT', 'XS-DOT', 'DOT-'];
 
 // Services
-const CONFIG_SERVICE = U('1000');     // (not used here)
-const MEAS_SERVICE   = U('2000');     // Measurement (stream)
+const MEAS_SERVICE   = U('2000'); // Measurement (stream)
 
 // Characteristics (measurement)
-const MEAS_CONTROL  = U('2001');      // write/read: start/stop + payload
-const PAYLOAD_LONG  = U('2002');      // notify: long
-const PAYLOAD_MED   = U('2003');      // notify: medium
-const PAYLOAD_SHORT = U('2004');      // notify: short
+const MEAS_CONTROL  = U('2001');  // write: select payload + start/stop
+const PAYLOAD_LONG  = U('2002');  // notify: long   (not used here)
+const PAYLOAD_MED   = U('2003');  // notify: medium (we use this)
+const PAYLOAD_SHORT = U('2004');  // notify: short  (not used here)
 
-// Payload modes we commonly use on short payload char (0x2004)
-const PAYLOAD_EULER      = 0x04; // Euler angles (deg)
-const PAYLOAD_QUATERNION = 0x05; // Quaternion (w,x,y,z)
-const PAYLOAD_FREEACC    = 0x06; // Free acceleration (m/s^2)
+// --------- Payload modes (per spec) ---------
+// We want both Euler + Free Accel together → "Complete (Euler)" = mode 16 (0x10)
+// Structure (total 28 bytes): Timestamp(4) + Euler(12) + FreeAcc(12)
+// Ref: Movella DOT BLE Services Spec, Table 15 & list (modes 4,5,6,7,16 etc).
+// https://www.xsens.com/hubfs/Downloads/Manuals/Xsens%20DOT%20BLE%20Services%20Specifications.pdf
+const MODE_ORI_EULER          = 0x04; // short
+const MODE_ORI_QUAT           = 0x05; // short
+const MODE_FREEACC            = 0x06; // short
+const MODE_EXT_EULER          = 0x07; // medium (euler + freeacc + status + clip)
+const MODE_COMPLETE_EULER     = 0x10; // medium (euler + freeacc)  <-- we use this
+const MODE_COMPLETE_QUAT      = 0x03; // medium (quat + freeacc)
 
-// ---- SELECT YOUR MODE HERE (kept as before) ----
-const SELECTED_PAYLOAD_MODE = PAYLOAD_EULER; // default Euler
-// const SELECTED_PAYLOAD_MODE = PAYLOAD_QUATERNION;
-// const SELECTED_PAYLOAD_MODE = PAYLOAD_FREEACC;
-
-// Map payload mode -> which notify characteristic to monitor
-const payloadModeToChar = (mode) => {
-  if (mode === 0x04 || mode === 0x05 || mode === 0x06) return PAYLOAD_SHORT;
-  return PAYLOAD_MED; // safe default for other modes
-};
+// We will hard-select COMPLETE_EULER to show angles + acceleration together
+const SELECTED_PAYLOAD_MODE = MODE_COMPLETE_EULER;
 
 const MAX_SAMPLES = 25;
 
@@ -54,69 +52,33 @@ if (typeof global.Buffer === 'undefined') {
 
 // ---------- helpers ----------
 const toTimeLabel = (timestamp) => {
-  const date = new Date(timestamp);
-  const h = String(date.getHours()).padStart(2, '0');
-  const m = String(date.getMinutes()).padStart(2, '0');
-  const s = String(date.getSeconds()).padStart(2, '0');
-  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  const d = new Date(timestamp);
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  const s = String(d.getSeconds()).padStart(2, '0');
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
   return `${h}:${m}:${s}.${ms}`;
 };
 
-const toHex = (buffer) => Array.from(buffer)
-  .map((b) => b.toString(16).padStart(2, '0'))
-  .join(' ');
+const toHex = (buffer) => Array.from(buffer).map((b) => b.toString(16).padStart(2, '0')).join(' ');
 
-// ---- CORRECT DECODER: skip 4B timestamp, then read floats by mode ----
-const parseDotPayload = (buf, mode) => {
-  if (!buf || buf.length < 4) {
-    return { dotTimestampUs: 0, floats: [] };
+// ---- Decoder for COMPLETE_EULER (mode 0x10): TS + Euler(xyz) + FreeAcc(xyz) ----
+const parseCompleteEuler = (buf) => {
+  // Expect at least 4 + 12 + 12 = 28 bytes
+  if (!buf || buf.length < 28) {
+    return { dotTimestampUs: 0, euler: [0, 0, 0], acc: [0, 0, 0] };
   }
-  const dotTimestampUs = buf.readUInt32LE(0); // sensor timestamp (µs)
-  const payload = buf.slice(4);
-
-  let count = 0;
-  if (mode === PAYLOAD_EULER) count = 3;          // X,Y,Z (deg)
-  else if (mode === PAYLOAD_QUATERNION) count = 4; // w,x,y,z
-  else if (mode === PAYLOAD_FREEACC) count = 3;    // X,Y,Z (m/s^2)
-  else count = Math.floor(payload.length / 4);     // fallback
+  const ts = buf.readUInt32LE(0);
+  const payload = buf.slice(4); // Now 24 bytes (6 floats)
 
   const floats = [];
-  for (let i = 0; i < count && (i * 4 + 3) < payload.length; i++) {
+  for (let i = 0; i < 6; i++) {
     const v = payload.readFloatLE(i * 4);
-    floats.push(Number.isFinite(v) ? Number(v.toFixed(4)) : 0);
+    floats.push(Number.isFinite(v) ? v : 0);
   }
-  return { dotTimestampUs, floats };
-};
-
-// Build display fields based on selected mode
-const getLabeledFields = (sample, mode) => {
-  if (!sample) return [];
-  const f = sample.floats || [];
-  const fields = [];
-
-  if (mode === PAYLOAD_EULER) {
-    const [x = 0, y = 0, z = 0] = f;
-    fields.push({ label: 'Rotation X (deg)', value: x.toFixed(3) });
-    fields.push({ label: 'Rotation Y (deg)', value: y.toFixed(3) });
-    fields.push({ label: 'Rotation Z (deg)', value: z.toFixed(3) });
-  } else if (mode === PAYLOAD_QUATERNION) {
-    const [w = 0, x = 0, y = 0, z = 0] = f;
-    fields.push({ label: 'qW', value: w.toFixed(4) });
-    fields.push({ label: 'qX', value: x.toFixed(4) });
-    fields.push({ label: 'qY', value: y.toFixed(4) });
-    fields.push({ label: 'qZ', value: z.toFixed(4) });
-  } else if (mode === PAYLOAD_FREEACC) {
-    const [ax = 0, ay = 0, az = 0] = f;
-    fields.push({ label: 'Accel X (m/s²)', value: ax.toFixed(3) });
-    fields.push({ label: 'Accel Y (m/s²)', value: ay.toFixed(3) });
-    fields.push({ label: 'Accel Z (m/s²)', value: az.toFixed(3) });
-  } else {
-    f.slice(0, 6).forEach((v, i) => fields.push({ label: `Float ${i}`, value: v.toFixed(3) }));
-  }
-
-  fields.push({ label: 'DOT Timestamp (µs)', value: String(sample.dotTimestampUs || 0) });
-  fields.push({ label: 'Host Time', value: toTimeLabel(sample.timestamp) });
-  return fields;
+  const euler = floats.slice(0, 3); // degrees
+  const acc   = floats.slice(3, 6); // m/s^2 (free acceleration)
+  return { dotTimestampUs: ts, euler, acc };
 };
 
 const getErrorMessage = (e) => {
@@ -132,7 +94,7 @@ export default function App() {
   const [isScanning, setIsScanning] = useState(false);
   const [connectedDevice, setConnectedDevice] = useState(null);
   const [devices, setDevices] = useState([]);
-  const [samples, setSamples] = useState([]);
+  const [samples, setSamples] = useState([]); // each sample: {timestamp, dotTimestampUs, euler[3], acc[3], hex}
   const [error, setError] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
 
@@ -140,12 +102,14 @@ export default function App() {
   const monitorRef = useRef(null);
   const devicesRef = useRef(new Map());
 
+  // global error handler
   useEffect(() => {
     const handleError = (err) => setError(getErrorMessage(err));
     const prev = global.ErrorUtils?.setGlobalHandler?.(handleError);
     return () => { if (prev) global.ErrorUtils?.setGlobalHandler?.(prev); };
   }, []);
 
+  // init & cleanup BLE
   useEffect(() => {
     const initBLE = async () => {
       const state = await manager.state();
@@ -163,6 +127,7 @@ export default function App() {
     };
   }, [manager]);
 
+  // auto cleanup on disconnect
   useEffect(() => {
     if (!connectedDevice) return;
     const sub = manager.onDeviceDisconnected(connectedDevice.id, () => {
@@ -228,17 +193,21 @@ export default function App() {
     scanTimeoutRef.current = setTimeout(stopScan, 15000);
   }, [manager, requestPermissions, stopScan]);
 
+  const writeControl = async (device, bytes) => {
+    const v = Buffer.from(bytes).toString('base64');
+    try {
+      await device.writeCharacteristicWithResponseForService(MEAS_SERVICE, MEAS_CONTROL, v);
+    } catch {
+      await device.writeCharacteristicWithoutResponseForService(MEAS_SERVICE, MEAS_CONTROL, v);
+    }
+  };
+
   const handleDisconnect = useCallback(async () => {
     setError('');
     if (!connectedDevice) return;
     try {
       if (isStreaming) {
-        const stopCmd = Buffer.from([0x01, 0x00, 0x00]).toString('base64');
-        try {
-          await connectedDevice.writeCharacteristicWithResponseForService(MEAS_SERVICE, MEAS_CONTROL, stopCmd);
-        } catch {
-          await connectedDevice.writeCharacteristicWithoutResponseForService(MEAS_SERVICE, MEAS_CONTROL, stopCmd);
-        }
+        await writeControl(connectedDevice, [0x01, 0x00, 0x00]); // stop
       }
     } catch {}
     monitorRef.current?.remove?.();
@@ -249,6 +218,39 @@ export default function App() {
     setSamples([]);
   }, [connectedDevice, isStreaming, manager]);
 
+  const bindMonitorCompleteEuler = useCallback(async (device) => {
+    // Complete(Euler) is a MEDIUM payload → notify on 0x2003
+    monitorRef.current?.remove?.();
+    monitorRef.current = device.monitorCharacteristicForService(
+      MEAS_SERVICE,
+      PAYLOAD_MED,
+      (monitorError, characteristic) => {
+        try {
+          if (monitorError) { setError(getErrorMessage(monitorError)); return; }
+          if (!characteristic?.value) return;
+
+          const buf = Buffer.from(characteristic.value, 'base64');
+          const { dotTimestampUs, euler, acc } = parseCompleteEuler(buf);
+
+          setSamples((prev) => {
+            const next = [{
+              id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+              timestamp: Date.now(), // host time
+              dotTimestampUs,
+              euler, // [x,y,z] degrees
+              acc,   // [ax,ay,az] m/s^2
+              hex: toHex(buf),
+            }, ...prev];
+            if (next.length > MAX_SAMPLES) next.length = MAX_SAMPLES;
+            return next;
+          });
+        } catch (e) {
+          setError(getErrorMessage(e));
+        }
+      }
+    );
+  }, [setSamples]);
+
   const handleConnect = useCallback(async (deviceId) => {
     await handleDisconnect();
     setError('');
@@ -258,55 +260,20 @@ export default function App() {
       await device.discoverAllServicesAndCharacteristics();
       setConnectedDevice(device);
 
-      const measSvc = (await device.services()).find((s) => s.uuid.toLowerCase() === MEAS_SERVICE.toLowerCase());
-      if (!measSvc) throw new Error('Measurement service not found');
-
-      const desiredCharUUID = payloadModeToChar(SELECTED_PAYLOAD_MODE).toLowerCase();
-      const measChars = await device.characteristicsForService(measSvc.uuid);
-      const measChar = measChars.find((c) => c.isNotifiable && c.uuid.toLowerCase() === desiredCharUUID);
-      if (!measChar) throw new Error('Notifiable measurement characteristic not found');
-
-      monitorRef.current?.remove?.();
-      monitorRef.current = device.monitorCharacteristicForService(
-        measSvc.uuid,
-        measChar.uuid,
-        (monitorError, characteristic) => {
-          if (monitorError) { setError(getErrorMessage(monitorError)); return; }
-          if (!characteristic?.value) return;
-
-          // ---- decode with correct offset & mode ----
-          const buf = Buffer.from(characteristic.value, 'base64');
-          const { dotTimestampUs, floats } = parseDotPayload(buf, SELECTED_PAYLOAD_MODE);
-
-          setSamples((prev) => {
-            const next = [{
-              id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-              timestamp: Date.now(),         // host time
-              dotTimestampUs,                // sensor timestamp
-              hex: toHex(buf),               // raw helper
-              floats,
-            }, ...prev];
-            if (next.length > MAX_SAMPLES) next.length = MAX_SAMPLES;
-            return next;
-          });
-        }
-      );
+      // bind monitor for medium payload stream (Complete Euler)
+      await bindMonitorCompleteEuler(device);
     } catch (e) {
       setConnectedDevice(null);
       setError(getErrorMessage(e));
     }
-  }, [handleDisconnect, manager, stopScan]);
+  }, [bindMonitorCompleteEuler, handleDisconnect, manager, stopScan]);
 
   const handleStartStream = useCallback(async () => {
     if (!connectedDevice) return;
     setError('');
     try {
-      const cmd = Buffer.from([0x01, 0x01, SELECTED_PAYLOAD_MODE]).toString('base64'); // [Type=1, Start=1, Mode]
-      try {
-        await connectedDevice.writeCharacteristicWithResponseForService(MEAS_SERVICE, MEAS_CONTROL, cmd);
-      } catch {
-        await connectedDevice.writeCharacteristicWithoutResponseForService(MEAS_SERVICE, MEAS_CONTROL, cmd);
-      }
+      // Start measurement in "Complete (Euler)" mode (0x10)
+      await writeControl(connectedDevice, [0x01, 0x01, SELECTED_PAYLOAD_MODE]);
       setIsStreaming(true);
     } catch (e) {
       setError(getErrorMessage(e));
@@ -317,18 +284,14 @@ export default function App() {
     if (!connectedDevice) return;
     setError('');
     try {
-      const cmd = Buffer.from([0x01, 0x00, 0x00]).toString('base64'); // stop
-      try {
-        await connectedDevice.writeCharacteristicWithResponseForService(MEAS_SERVICE, MEAS_CONTROL, cmd);
-      } catch {
-        await connectedDevice.writeCharacteristicWithoutResponseForService(MEAS_SERVICE, MEAS_CONTROL, cmd);
-      }
+      await writeControl(connectedDevice, [0x01, 0x00, 0x00]); // stop
       setIsStreaming(false);
     } catch (e) {
       setError(getErrorMessage(e));
     }
   }, [connectedDevice]);
 
+  // UI rows
   const renderDevice = ({ item }) => (
     <TouchableOpacity style={styles.deviceRow} onPress={() => handleConnect(item.id)}>
       <View>
@@ -342,14 +305,17 @@ export default function App() {
   const renderSample = ({ item }) => (
     <View style={styles.sampleRow}>
       <Text style={styles.sampleTime}>{toTimeLabel(item.timestamp)}</Text>
-      {item.hex ? <Text style={styles.sampleHex}>{item.hex}</Text> : null}
-      {item.floats?.length ? <Text style={styles.sampleFloats}>{item.floats.join(' ')}</Text> : null}
+      <Text style={styles.sampleFloats}>
+        Euler (deg) — X: {item.euler?.[0]?.toFixed?.(3) ?? '0.000'} | Y: {item.euler?.[1]?.toFixed?.(3) ?? '0.000'} | Z: {item.euler?.[2]?.toFixed?.(3) ?? '0.000'}
+      </Text>
+      <Text style={styles.sampleFloats}>
+        Acc (m/s²) — X: {item.acc?.[0]?.toFixed?.(3) ?? '0.000'} | Y: {item.acc?.[1]?.toFixed?.(3) ?? '0.000'} | Z: {item.acc?.[2]?.toFixed?.(3) ?? '0.000'}
+      </Text>
     </View>
   );
 
-  // ------ CURRENT DATA PANEL (labels) ------
-  const current = samples.length ? samples[0] : null;
-  const labeled = current ? getLabeledFields(current, SELECTED_PAYLOAD_MODE) : [];
+  // Current panel
+  const current = samples[0];
 
   return (
     <SafeAreaView style={styles.container}>
@@ -377,7 +343,7 @@ export default function App() {
         ) : null}
       </View>
 
-      {/* CURRENT DATA */}
+      {/* CURRENT DATA (Angles + Acceleration together) */}
       {connectedDevice ? (
         <View style={styles.card}>
           <View style={styles.cardHeader}>
@@ -386,14 +352,14 @@ export default function App() {
               <TouchableOpacity
                 onPress={handleStartStream}
                 disabled={isStreaming}
-                style={[styles.smallButton, isStreaming ? styles.buttonDisabled : null]}
+                style={[styles.smallButton, isStreaming && styles.buttonDisabled]}
               >
                 <Text style={styles.smallButtonText}>Start</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 onPress={handleStopStream}
                 disabled={!isStreaming}
-                style={[styles.smallButton, !isStreaming ? styles.buttonDisabled : null]}
+                style={[styles.smallButton, !isStreaming && styles.buttonDisabled]}
               >
                 <Text style={styles.smallButtonText}>Stop</Text>
               </TouchableOpacity>
@@ -402,12 +368,40 @@ export default function App() {
 
           {current ? (
             <View style={styles.grid}>
-              {labeled.map((row) => (
-                <View key={row.label} style={styles.kv}>
-                  <Text style={styles.kLabel}>{row.label}</Text>
-                  <Text style={styles.kValue}>{row.value}</Text>
-                </View>
-              ))}
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Rotation X (deg)</Text>
+                <Text style={styles.kValue}>{current.euler[0].toFixed(3)}</Text>
+              </View>
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Rotation Y (deg)</Text>
+                <Text style={styles.kValue}>{current.euler[1].toFixed(3)}</Text>
+              </View>
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Rotation Z (deg)</Text>
+                <Text style={styles.kValue}>{current.euler[2].toFixed(3)}</Text>
+              </View>
+
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Accel X (m/s²)</Text>
+                <Text style={styles.kValue}>{current.acc[0].toFixed(3)}</Text>
+              </View>
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Accel Y (m/s²)</Text>
+                <Text style={styles.kValue}>{current.acc[1].toFixed(3)}</Text>
+              </View>
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Accel Z (m/s²)</Text>
+                <Text style={styles.kValue}>{current.acc[2].toFixed(3)}</Text>
+              </View>
+
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>DOT Timestamp (µs)</Text>
+                <Text style={styles.kValue}>{String(current.dotTimestampUs)}</Text>
+              </View>
+              <View style={styles.kv}>
+                <Text style={styles.kLabel}>Host Time</Text>
+                <Text style={styles.kValue}>{toTimeLabel(current.timestamp)}</Text>
+              </View>
             </View>
           ) : (
             <Text style={styles.placeholder}>Waiting for data…</Text>
@@ -453,15 +447,18 @@ const styles = StyleSheet.create({
   statusOnline: { color: '#4cc38a' },
   statusOffline: { color: '#ff6b6b' },
   error: { color: '#ff6b6b', textAlign: 'center', marginBottom: 12 },
+
   actions: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
   button: { flex: 1, backgroundColor: '#137bf4', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginRight: 8 },
   buttonSecondary: { flex: 1, backgroundColor: '#2b2f36', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginLeft: 8 },
   buttonActive: { backgroundColor: '#0f5ec0' },
   buttonText: { color: '#f4f6fb', fontSize: 16, fontWeight: '500' },
+
   section: { flex: 1, marginBottom: 16 },
   sectionTitle: { color: '#f4f6fb', fontSize: 18, fontWeight: '600', marginBottom: 8 },
   listEmpty: { flexGrow: 1, justifyContent: 'center', alignItems: 'center' },
   placeholder: { color: '#98a1b3' },
+
   deviceRow: { backgroundColor: '#11141a', borderRadius: 10, padding: 16, marginBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   deviceName: { color: '#f4f6fb', fontSize: 16, fontWeight: '500' },
   deviceId: { color: '#768098', fontSize: 12, marginTop: 4 },
@@ -485,6 +482,5 @@ const styles = StyleSheet.create({
   // Raw stream row
   sampleRow: { backgroundColor: '#0b0d12', borderRadius: 10, padding: 14, marginBottom: 10 },
   sampleTime: { color: '#98a1b3', fontSize: 12, marginBottom: 6 },
-  sampleHex: { color: '#f4f6fb', fontSize: 14, marginBottom: 6 },
   sampleFloats: { color: '#ffb86b', fontSize: 12 },
 });
